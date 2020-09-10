@@ -46,6 +46,8 @@ use std::{
 use tokio::{task::JoinHandle, time};
 
 const MAX_TXN_BATCH_SIZE: usize = 100; // Max transactions per account in mempool
+const DD_KEY: &str = "dd.key";
+const VASP_KEY: &str = "vasp.key";
 
 pub struct TxEmitter {
     accounts: Vec<AccountData>,
@@ -114,6 +116,14 @@ pub static GAS_UNIT_PRICE: Lazy<u64> = Lazy::new(|| {
         v.parse().expect("Failed to parse GAS_UNIT_PRICE")
     } else {
         0_u64
+    }
+});
+
+pub static PREMAINNET: Lazy<bool> = Lazy::new(|| {
+    if let Ok(v) = env::var("PREMAINNET") {
+        v.parse().expect("Failed to parse PREMAINNET")
+    } else {
+        false
     }
 });
 
@@ -298,6 +308,78 @@ impl TxEmitter {
         })
     }
 
+    pub async fn load_dd_account(&self, instance: &Instance) -> Result<AccountData> {
+        let client = instance.json_rpc_client();
+        let mint_key: Ed25519PrivateKey = generate_key::load_key(DD_KEY);
+        let mint_key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey> = KeyPair::from(mint_key);
+        let address = libra_types::account_address::from_public_key(&mint_key_pair.public_key);
+        let sequence_number = query_sequence_numbers(&client, &[address])
+            .await
+            .map_err(|e| {
+                format_err!(
+                    "query_sequence_numbers on {:?} for dd account failed: {}",
+                    client,
+                    e
+                )
+            })?[0];
+        Ok(AccountData {
+            address,
+            key_pair: mint_key_pair.clone(),
+            sequence_number,
+        })
+    }
+
+    pub async fn load_vasp_account(&self, instance: &Instance) -> Result<AccountData> {
+        let client = instance.json_rpc_client();
+        let mint_key: Ed25519PrivateKey = generate_key::load_key(VASP_KEY);
+        let mint_key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey> = KeyPair::from(mint_key);
+        let address = libra_types::account_address::from_public_key(&mint_key_pair.public_key);
+        let sequence_number = query_sequence_numbers(&client, &[address])
+            .await
+            .map_err(|e| {
+                format_err!(
+                    "query_sequence_numbers on {:?} for vasp account failed: {}",
+                    client,
+                    e
+                )
+            })?[0];
+        Ok(AccountData {
+            address,
+            key_pair: mint_key_pair.clone(),
+            sequence_number,
+        })
+    }
+
+    pub async fn get_faucet_account(&self, instances: &Vec<Instance>, coins_total: u64) -> Result<AccountData> {
+        let inst = self.pick_mint_instance(instances);
+        if *PREMAINNET {
+            info!("Loading faucet account from DD account");
+            return Ok(self.load_dd_account(inst).await?);
+        }
+        info!("Creating and minting faucet account");
+        let mut faucet_account = self.load_faucet_account(inst).await?;
+        let mint_txn = gen_mint_request(&mut faucet_account, coins_total, self.chain_id);
+        execute_and_wait_transactions(
+            &mut self.pick_mint_client(instances),
+            &mut faucet_account,
+            vec![mint_txn],
+        )
+        .await
+        .map_err(|e| format_err!("Failed to mint into faucet account: {}", e))?;
+
+        Ok(faucet_account)
+    }
+
+    pub async fn get_tc_account(&self, instances: &Vec<Instance>) -> Result<AccountData> {
+        let inst = self.pick_mint_instance(instances);
+        if *PREMAINNET {
+            info!("Loading treasury compliance account from DD account");
+            return Ok(self.load_vasp_account(inst).await?);
+        }
+        info!("Creating treasury compliance account");
+        Ok(self.load_tc_account(inst).await?)
+    }
+
     pub async fn mint_accounts(
         &mut self,
         req: &EmitJobRequest,
@@ -308,27 +390,16 @@ impl TxEmitter {
             return Ok(()); // Early return to skip printing 'Minting ...' logs
         }
         let num_accounts = requested_accounts - self.accounts.len(); // Only minting extra accounts
-        info!("Minting additional {} accounts", num_accounts);
-        let mut faucet_account = self
-            .load_faucet_account(self.pick_mint_instance(&req.instances))
-            .await?;
-        let mut tc_account = self
-            .load_tc_account(self.pick_mint_instance(&req.instances))
-            .await?;
         let coins_per_account = (SEND_AMOUNT + *GAS_UNIT_PRICE) * MAX_TXNS;
-        info!("Minting additional {} accounts", num_accounts);
         let coins_per_seed_account =
             (coins_per_account * num_accounts as u64) / req.instances.len() as u64;
         let coins_total = coins_per_account * num_accounts as u64;
-        let mint_txn = gen_mint_request(&mut faucet_account, coins_total, self.chain_id);
-        execute_and_wait_transactions(
-            &mut self.pick_mint_client(&req.instances),
-            &mut faucet_account,
-            vec![mint_txn],
-        )
-        .await
-        .map_err(|e| format_err!("Failed to mint into faucet account: {}", e))?;
 
+        info!("Minting additional {} accounts", num_accounts);
+        let mut faucet_account = self.get_faucet_account(&req.instances, coins_total).await?;
+        let mut tc_account = self.get_tc_account(&req.instances).await?;
+
+        // Create seed accounts with which we can create actual accounts concurrently
         let seed_accounts = create_seed_accounts(
             &mut tc_account,
             req.instances.len(),
@@ -339,7 +410,7 @@ impl TxEmitter {
         .await
         .map_err(|e| format_err!("Failed to create seed accounts: {}", e))?;
         info!("Completed creating seed accounts");
-        // Create seed accounts with which we can create actual accounts concurrently
+
         mint_to_new_accounts(
             &mut faucet_account,
             &seed_accounts,
@@ -351,6 +422,7 @@ impl TxEmitter {
         .await
         .map_err(|e| format_err!("Failed to mint seed_accounts: {}", e))?;
         info!("Completed minting seed accounts");
+
         // For each seed account, create a future and transfer libra from that seed account to new accounts
         let account_futures = seed_accounts
             .into_iter()
@@ -376,6 +448,7 @@ impl TxEmitter {
             .into_iter()
             .flatten()
             .collect();
+        info!("Completed minting actual accounts");
 
         self.accounts.append(&mut minted_accounts);
         assert!(
@@ -385,6 +458,7 @@ impl TxEmitter {
             self.accounts.len()
         );
         info!("Mint is done");
+
         Ok(())
     }
 
